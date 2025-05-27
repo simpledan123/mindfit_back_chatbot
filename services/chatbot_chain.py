@@ -2,14 +2,13 @@ from langchain.chat_models import ChatOpenAI
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
 from langchain.schema import Document, SystemMessage, HumanMessage
 from dotenv import load_dotenv
 import os
 import sqlite3
 from typing import List
 
-from crud.chatbot import get_user_summary, save_user_summary, save_user_keywords
+from crud.chatbot import get_user_summary, save_user_summary, save_user_keywords, get_user_keywords
 from models.user import User
 from sqlalchemy.orm import Session
 
@@ -61,11 +60,29 @@ def classify_intent(query: str, summary: str) -> str:
     ]
     return llm(messages).content.strip()
 
+# 요약 줄 수 제한 (10줄 이상 시 한 줄씩 삭제)
+def truncate_if_too_long(text: str, max_lines: int = 10) -> str:
+    lines = text.strip().split("\n")
+    if len(lines) > max_lines:
+        return "\n".join(lines[-max_lines:])
+    return text
+
 # 메인 응답 생성 함수
 def generate_chat_response(user: User, message: str, db: Session):
+    # 사용자 선호 질문 감지
+    if "좋아하는 음식" in message or "내가 뭘 좋아" in message:
+        keywords_obj = get_user_keywords(db, user.id)
+        if keywords_obj and keywords_obj.keywords:
+            return {"response": f"당신은 이런 음식들을 좋아한다고 하셨어요: {keywords_obj.keywords}"}
+        else:
+            return {"response": "아직 당신의 음식 취향을 잘 몰라요. 매운 음식, 한식 등 말씀해 주세요!"}
+
+    # summary 불러오기 + 길이 제한
     summary_obj = get_user_summary(db, user.id)
     summary = getattr(summary_obj, "summary", "")
+    summary = truncate_if_too_long(summary)
 
+    # 의도 분류
     intent = classify_intent(message, summary)
 
     if intent != "추천":
@@ -74,14 +91,17 @@ def generate_chat_response(user: User, message: str, db: Session):
             HumanMessage(content=message)
         ]
         result = llm(messages).content.strip()
+
         summary += f"\n[User]: {message}\n[Bot]: {result}"
+        summary = truncate_if_too_long(summary)
         save_user_summary(db, user.id, summary)
+
         return {"response": result}
 
-    # 추천 요청 처리
-    results = vectorstore.similarity_search(message, k=3)
+    # 추천 요청 처리 (기본 2개 추천)
+    results = vectorstore.similarity_search(message, k=2)
     if not results:
-        return {"response": "입력하신 정보로는 추천할 수 있는 식당이 없습니다. 위치나 키워드를 다시 시도해주세요."}
+        return {"response": "입력하신 정보로는 추천할 수 있는 식당이 없습니다. 위치나 키워드를 다시 시도해 주세요."}
 
     recommended = []
     for doc in results:
@@ -92,7 +112,9 @@ def generate_chat_response(user: User, message: str, db: Session):
     response_text = "\n".join(recommended)
 
     summary += f"\n[User]: {message}\n[Bot]: {response_text}"
+    summary = truncate_if_too_long(summary)
     save_user_summary(db, user.id, summary)
+
     keywords = extract_keywords_from_summary(summary)
     save_user_keywords(db, user.id, keywords)
 
